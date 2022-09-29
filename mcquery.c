@@ -2,6 +2,7 @@
 #include <getopt.h>
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include "logger.h"
 #include "mcquery.h"
@@ -9,23 +10,33 @@
 struct mcq_opts {
 	struct igmp_query_params *mc_igmp;
 	struct mld_query_params *mc_mld;
+	char mc_send;
+	char mc_recv;
 	char mc_raw;
 };
 
 void igmp_exit(void);
 int igmp_init(void);
+void igmp_bind(struct query_interface *qi);
+void igmp_handle(void);
 int igmp_emit(struct query_interface *qi, struct igmp_query_params *qp);
 
 void rawigmp_exit(void);
 int rawigmp_init(void);
+void rawigmp_bind(struct query_interface *qi);
+void rawigmp_handle(void);
 int rawigmp_emit(struct query_interface *qi, struct igmp_query_params *qp);
 
 void mld_exit(void);
 int mld_init(void);
+void mld_bind(struct query_interface *qi);
+void mld_handle(void);
 int mld_emit(struct query_interface *qi, struct mld_query_params *qp);
 
 void rawmld_exit(void);
 int rawmld_init(void);
+void rawmld_bind(struct query_interface *qi);
+void rawmld_handle(void);
 int rawmld_emit(struct query_interface *qi, struct mld_query_params *qp);
 
 int log_verbose = 0;
@@ -46,12 +57,15 @@ static char *progname(char *arg0)
 
 static int usage(int code)
 {
-	printf("Usage: %s [-i INTERFACE] [-r] [igmp[:<version>[,<key>:<value>...]]] [mld[:<version>[,<key>:<value>...]]]\n"
+	printf("Usage: %s [-i INTERFACE] [-u] [-r] [-l|-s] [igmp[:<version>[,<key>:<value>...]]] [mld[:<version>[,<key>:<value>...]]]\n"
 	       "\n"
 	       "Options:\n"
 	       "  -h, --help               Show this help text\n"
 	       "  -v, --verbose            Perform verbose operation\n"
-	       "  -i, --interface <name>   Interface to use\n"
+	       "  -s, --submit             Send multicast query (default)\n"
+	       "  -l, --listen             Listen for multicast queries/reports\n"
+	       "  -i, --interface <name>   Interface to use for sending/receiving multicast\n"
+	       "  -u, --unbound            Do not bind to interface\n"
 	       "  -r, --raw                Use RAW sockets\n"
 	       "\n"
 	       "Parameters:\n"
@@ -182,6 +196,85 @@ static void mcq_dump_opts(struct mcq_opts *o)
 	}
 }
 
+static void mcq_recv(struct query_interface *qi, struct mcq_opts *o)
+{
+	struct pollfd pfd[2];
+	int igmp_fd = -1;
+	int mld_fd = -1;
+	int n;
+
+	if (o->mc_raw) {
+		if (o->mc_igmp) {
+			igmp_fd = rawigmp_init();
+			if (qi)
+				rawigmp_bind(qi);
+		}
+		if (o->mc_mld) {
+			mld_fd = rawmld_init();
+			if (qi)
+				rawmld_bind(qi);
+		}
+	} else {
+		if (o->mc_igmp) {
+			igmp_fd = igmp_init();
+			if (qi)
+				igmp_bind(qi);
+		}
+		if (o->mc_mld) {
+			mld_fd = mld_init();
+			if (qi)
+				mld_bind(qi);
+		}
+	}
+
+	pfd[0].fd = igmp_fd;
+	pfd[0].events = POLLIN;
+	pfd[1].fd = mld_fd;
+	pfd[1].events = POLLIN;
+
+	while (1) {
+		n = poll(pfd, 2, -1);
+		if (n < 0) {
+			if (errno != EINTR)
+				die("poll() failed");
+			continue;
+		}
+
+		if (n == 0)
+			continue;
+
+		if (pfd[0].revents & POLLIN) {
+			if (o->mc_raw)
+				rawigmp_handle();
+			else
+				igmp_handle();
+		}
+		if (pfd[1].revents & POLLIN) {
+			if (o->mc_raw)
+				rawmld_handle();
+			else
+				mld_handle();
+		}
+	}
+
+	if (o->mc_raw) {
+		if (o->mc_igmp) {
+			rawigmp_exit();
+		}
+		if (o->mc_mld) {
+			rawmld_exit();
+		}
+	} else {
+		if (o->mc_igmp) {
+			igmp_exit();
+		}
+		if (o->mc_mld) {
+			mld_exit();
+		}
+	}
+
+}
+
 void mcq_send(struct query_interface *qi, struct mcq_opts *o)
 {
 	if (o->mc_raw) {
@@ -212,6 +305,7 @@ void mcq_send(struct query_interface *qi, struct mcq_opts *o)
 int main(int argc, char *argv[])
 {
 	int ch, i;
+	int opt_unbound = 0;
 	char *opt_ifname = NULL;
 	struct mcq_opts opts = { 0 };
 	struct query_interface *qi = NULL;
@@ -219,15 +313,18 @@ int main(int argc, char *argv[])
 	struct option long_options[] = {
 		{ "help", no_argument, NULL, 'h' },
 		{ "verbose", no_argument, NULL, 'v' },
-		{ "raw", no_argument, NULL, 'r' },
+		{ "submit", no_argument, NULL, 's' },
+		{ "listen", no_argument, NULL, 'l' },
 		{ "interface", required_argument, NULL, 'i' },
+		{ "unbound", no_argument, NULL, 'u' },
+		{ "raw", no_argument, NULL, 'r' },
 		{ NULL, 0, NULL, 0 }
 	};
 
 	setlinebuf(stderr);
 
 	program = progname(argv[0]);
-	while ((ch = getopt_long(argc, argv, "hvri:", long_options, NULL)) != EOF) {
+	while ((ch = getopt_long(argc, argv, "hvsli:ur", long_options, NULL)) != EOF) {
 		switch (ch) {
 		case 'h':
 			return usage(0);
@@ -236,8 +333,24 @@ int main(int argc, char *argv[])
 			log_verbose++;
 			break;
 
+		case 's':
+			if (opts.mc_recv)
+				return usage(1);
+			opts.mc_send = 1;
+			break;
+
+		case 'l':
+			if (opts.mc_send)
+				return usage(1);
+			opts.mc_recv = 1;
+			break;
+
 		case 'i':
 			opt_ifname = optarg;
+			break;
+
+		case 'u':
+			opt_unbound = 1;
 			break;
 
 		case 'r':
@@ -263,11 +376,14 @@ int main(int argc, char *argv[])
 		opts.mc_mld = parse_mld_params(NULL);
 	}
 
+	if (!opts.mc_send && !opts.mc_recv)
+		opts.mc_send = 1;
+
 	if (opt_ifname) {
 		qi = iface_get(opt_ifname);
 		if (!qi)
 			die("Failed to find %s network interface", opt_ifname);
-	} else {
+	} else if (!opt_unbound) {
 		qi = iface_first();
 		if (!qi)
 			die("Failed to get network interface");
@@ -275,7 +391,13 @@ int main(int argc, char *argv[])
 
 	mcq_dump_opts(&opts);
 
-	mcq_send(qi, &opts);
+	if (opts.mc_send) {
+		if (!qi)
+			die("Send operation requres interface");
+		mcq_send(qi, &opts);
+	} else if (opts.mc_recv) {
+		mcq_recv(qi, &opts);
+	}
 
 	return 0;
 }

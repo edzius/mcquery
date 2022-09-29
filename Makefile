@@ -10,6 +10,7 @@ CFLAGS += -Wp,-MT,$@,-MD,$(@D)/.$(@F).d
 CFLAGS += -D_GNU_SOURCE
 
 CFLAGS += -DDEBUG
+#CFLAGS += -DUSE_COOKED_SOCKET
 
 sources-y := igmp.c rawigmp.c mld.c rawmld.c helpers.c mcquery.c
 objects-y := $(patsubst %.c,%.o,$(sources-y))

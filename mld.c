@@ -15,20 +15,25 @@
 #include "mld.h"
 #include "mcquery.h"
 
+#define RECV_BUF_SIZE 1024
 #define SEND_BUF_SIZE 128
 #define CTRL_BUF_SIZE 128
 
 static int mld_socket;
 static uint8_t *ctrl_buf;
 static uint8_t *send_buf;
+static uint8_t *recv_buf;
 
 static const struct in6_addr allnodes_group = IN6ADDR_LINKLOCAL_ALLNODES_INIT;
+static const struct in6_addr allrouters_group = IN6ADDR_LINKLOCAL_ALLROUTERS_INIT;
+static const struct in6_addr allreports_group = IN6ADDR_LINKLOCAL_ALLREPORTS_INIT;
 
 void mld_exit(void)
 {
 	close(mld_socket);
 	free(ctrl_buf);
 	free(send_buf);
+	free(recv_buf);
 
 	log_debug("MLD finished");
 }
@@ -36,10 +41,26 @@ void mld_exit(void)
 int mld_init(void)
 {
 	int on = 1;
+	struct icmp6_filter filt;
 
 	mld_socket = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
 	if (mld_socket < 0)
 		die("socket(ICMP6) failed");
+
+        if (setsockopt(mld_socket, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)))
+		die("setsockopt(SO_REUSEADDR) failed");
+
+	/* filter all non-MLD ICMP messages */
+	ICMP6_FILTER_SETBLOCKALL(&filt);
+	ICMP6_FILTER_SETPASS(MLD_LISTENER_QUERY, &filt);
+	ICMP6_FILTER_SETPASS(MLD_LISTENER_REPORT, &filt);
+	ICMP6_FILTER_SETPASS(MLD_LISTENER_DONE, &filt);
+	ICMP6_FILTER_SETPASS(MLDV2_LISTENER_REPORT,&filt);
+	if (setsockopt(mld_socket, IPPROTO_ICMPV6, ICMP6_FILTER, &filt, sizeof(filt)) < 0)
+		die("setsockopt(ICMP6_FILTER) failed");
+
+	if (setsockopt(mld_socket, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on)) < 0)
+		die("setsockopt(IPV6_RECVPKTINFO) failed");
 
 	if (setsockopt(mld_socket, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &on, sizeof(on)) < 0)
 		die("setsockopt(IPV6_MULTICAST_HOPS) failed");
@@ -55,9 +76,163 @@ int mld_init(void)
 	if (!send_buf)
 		die("malloc(SEND_BUF) failed");
 
+	recv_buf = calloc(1, RECV_BUF_SIZE);
+	if (!recv_buf)
+		die("malloc(RECV_BUF) failed");
+
 	log_debug("MLD initialised, socket: %i", mld_socket);
 
 	return mld_socket;
+}
+
+void mld_bind(struct query_interface *qi)
+{
+	struct ipv6_mreq mreq = { 0 };
+
+	mreq.ipv6mr_interface = qi->qi_ifindex;
+	mreq.ipv6mr_multiaddr = allnodes_group;
+	if (setsockopt(mld_socket, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0)
+		die("setsockopt(IPV6_JOIN_GROUP) %s failed",
+		    inet6_fmt(&mreq.ipv6mr_multiaddr));
+
+	mreq.ipv6mr_multiaddr = allrouters_group;
+	if (setsockopt(mld_socket, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0)
+		die("setsockopt(IPV6_JOIN_GROUP) %s failed",
+		    inet6_fmt(&mreq.ipv6mr_multiaddr));
+
+	mreq.ipv6mr_multiaddr = allreports_group;
+	if (setsockopt(mld_socket, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0)
+		die("setsockopt(IPV6_JOIN_GROUP) %s failed",
+		    inet6_fmt(&mreq.ipv6mr_multiaddr));
+
+	/* SO_BINDTODEVICE does not receive leaves */
+	/* bind() ll address does not receive leaves */
+}
+
+void mld_handle(void)
+{
+	struct msghdr rcvmsg = { 0 };
+	struct iovec rcviov = { 0 };
+	struct sockaddr_in6 recv_addr = { 0 };
+	struct cmsghdr *cm;
+	struct in6_pktinfo *pi = NULL;
+
+	struct in6_addr *src, *dst;
+	struct mld_hdr *mld;
+	ssize_t recvlen;
+	ssize_t pktlen;
+	uint8_t *pktbuf;
+	unsigned int mld_version = 0;
+
+	rcviov.iov_base = (caddr_t)recv_buf;
+	rcviov.iov_len = RECV_BUF_SIZE;
+	rcvmsg.msg_control = (caddr_t)ctrl_buf;
+	rcvmsg.msg_controllen = CTRL_BUF_SIZE;
+	rcvmsg.msg_name = &recv_addr;
+	rcvmsg.msg_namelen = sizeof(recv_addr);
+	rcvmsg.msg_iov = &rcviov;
+	rcvmsg.msg_iovlen = 1;
+
+	while ((recvlen = recvmsg(mld_socket, &rcvmsg, 0)) < 0) {
+		if (errno == EINTR)
+			continue;
+		if (errno == EAGAIN)
+			return;
+
+		log_error("recvmsg(%i) MLD failed: %s (%i)",
+			  mld_socket, strerror(errno), errno);
+		return;
+	}
+
+	pktlen = recvlen;
+	pktbuf = recv_buf;
+
+	if (pktlen < sizeof(struct mld_hdr)) {
+		log_warn("received packet too short (%zu bytes) for MLD header", pktlen);
+		log_dump(recv_buf, recvlen);
+		return;
+	}
+
+	/* extract optional information via Advanced API */
+	for (cm = (struct cmsghdr *) CMSG_FIRSTHDR(&rcvmsg); cm;
+	     cm = (struct cmsghdr *) CMSG_NXTHDR(&rcvmsg, cm)) {
+		if (cm->cmsg_level == IPPROTO_IPV6 && cm->cmsg_type == IPV6_PKTINFO &&
+		    cm->cmsg_len == CMSG_LEN(sizeof(struct in6_pktinfo))) {
+			pi = (struct in6_pktinfo *) (CMSG_DATA(cm));
+			break;
+		}
+		/*
+		 * In case of MLDv1, since RFC2710 does not mention whether to
+		 * discard MLD packets with hop limit other than 1. Whereas in
+		 * case of MLDv2, it should be discarded as is stated in
+		 * draft-vida-mld-v2-08.txt section 6.2.
+		 * Despite all for this application keeping eyes closed what
+		 * relates to hop limit checking
+		 */
+	}
+
+	if (!pi) {
+		log_warn("failed to get Rx control information");
+		return;
+	}
+
+	dst = &pi->ipi6_addr;
+	src = &((struct sockaddr_in6 *)&recv_addr)->sin6_addr;
+
+	mld = (struct mld_hdr *)pktbuf;
+
+	/*
+	 * MLD version of a multicast listener Query is determined as
+	 * follow : MLDv1 query : recvlen = 24
+	 *          MLDv2 query : recvlen >= 28
+	 *          MLDv2 report type != MLDv1 report type
+	 * Query messages that do not match any of the above conditions are ignored.
+	 */
+	switch (mld->mld_type)
+	{
+	case MLD_LISTENER_QUERY:
+		if (pktlen == 24)
+			mld_version = 1;
+		if (pktlen >= 28) {
+			mld_version = 2;
+		}
+		break;
+
+	case MLD_LISTENER_DONE:
+	case MLD_LISTENER_REPORT:
+	case MLDV2_LISTENER_REPORT:
+		break;
+
+	default:
+		/* This must be impossible since we set a type filter */
+		log_warn("Got unknown ICMPV6 message type %x from %s to %s",
+			 mld->mld_type, inet6_fmt(src), inet6_fmt(dst));
+		log_dump(recv_buf, recvlen);
+		return;
+	}
+
+	log_notice("RECV %-16s from %-26s to %-18s on %-15s",
+		   mld_packet_kind(mld->mld_type, mld->mld_code, mld_version),
+		   inet6_fmt(src), inet6_fmt(dst), get_ifname(pi->ipi6_ifindex));
+
+	if (IN6_IS_ADDR_MC_NODELOCAL(&mld->mld_addr)) {
+		log_warn("Got %s with an invalid scope: %s from %s",
+			 mld_packet_kind(mld->mld_type, mld->mld_code, mld_version),
+			 inet6_fmt(&mld->mld_addr), inet6_fmt(src));
+	}
+
+	if (!IN6_IS_ADDR_LINKLOCAL(src)) {
+		/*
+		 * RFC3590 allows the IPv6 unspecified address as the source
+		 * address of MLD report and done messages.  However, as this
+		 * same document says, this special rule is for snooping
+		 * switches and the RFC requires routers to discard MLD packets
+		 * with the unspecified source address.
+		 */
+		log_warn("Got %s from a non link local address: %s",
+			 mld_packet_kind(mld->mld_type, mld->mld_code, mld_version),
+			 inet6_fmt(src));
+	}
 }
 
 int mld_emit(struct query_interface *qi, struct mld_query_params *qp)
