@@ -57,7 +57,7 @@ static char *progname(char *arg0)
 
 static int usage(int code)
 {
-	printf("Usage: %s [-i INTERFACE] [-u] [-r] [-l|-s] [igmp[:<version>[,<key>:<value>...]]] [mld[:<version>[,<key>:<value>...]]]\n"
+	printf("Usage: %s [-i INTERFACE] [-u] [-n] [-l|-s] [igmp[:<version>[,<key>:<value>...]]] [mld[:<version>[,<key>:<value>...]]]\n"
 	       "\n"
 	       "Options:\n"
 	       "  -h, --help               Show this help text\n"
@@ -66,7 +66,7 @@ static int usage(int code)
 	       "  -l, --listen             Listen for multicast queries/reports\n"
 	       "  -i, --interface <name>   Interface to use for sending/receiving multicast\n"
 	       "  -u, --unbound            Do not bind to interface\n"
-	       "  -r, --raw                Use RAW sockets\n"
+	       "  -n, --noraw              Use IP socket instead fo RAW socket\n"
 	       "\n"
 	       "Parameters:\n"
 	       "  * igmp:<version>         IGMP version, allowed values: 1, 2, 3, default: 2\n"
@@ -317,14 +317,16 @@ int main(int argc, char *argv[])
 		{ "listen", no_argument, NULL, 'l' },
 		{ "interface", required_argument, NULL, 'i' },
 		{ "unbound", no_argument, NULL, 'u' },
-		{ "raw", no_argument, NULL, 'r' },
+		{ "noraw", no_argument, NULL, 'n' },
 		{ NULL, 0, NULL, 0 }
 	};
 
 	setlinebuf(stderr);
 
+	opts.mc_raw = 1;
+
 	program = progname(argv[0]);
-	while ((ch = getopt_long(argc, argv, "hvsli:ur", long_options, NULL)) != EOF) {
+	while ((ch = getopt_long(argc, argv, "hvsli:un", long_options, NULL)) != EOF) {
 		switch (ch) {
 		case 'h':
 			return usage(0);
@@ -353,8 +355,8 @@ int main(int argc, char *argv[])
 			opt_unbound = 1;
 			break;
 
-		case 'r':
-			opts.mc_raw = 1;
+		case 'n':
+			opts.mc_raw = 0;
 			break;
 
 		default:
