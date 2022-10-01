@@ -11,7 +11,7 @@ CFLAGS += -D_GNU_SOURCE
 
 CFLAGS += -DDEBUG
 
-sources-y := mcquery.c
+sources-y := igmp.c rawigmp.c mld.c rawmld.c helpers.c mcquery.c
 objects-y := $(patsubst %.c,%.o,$(sources-y))
 depends-y := $(wildcard .*.d)
 
